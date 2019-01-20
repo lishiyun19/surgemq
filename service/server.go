@@ -15,6 +15,7 @@
 package service
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -134,6 +135,64 @@ func (this *Server) ListenAndServe(uri string) error {
 
 	this.ln, err = net.Listen(u.Scheme, u.Host)
 	if err != nil {
+		return err
+	}
+	defer this.ln.Close()
+
+	glog.Infof("server/ListenAndServe: server is ready...")
+
+	var tempDelay time.Duration // how long to sleep on accept failure
+
+	for {
+		conn, err := this.ln.Accept()
+
+		if err != nil {
+			// http://zhen.org/blog/graceful-shutdown-of-go-net-dot-listeners/
+			select {
+			case <-this.quit:
+				return nil
+
+			default:
+			}
+
+			// Borrowed from go1.3.3/src/pkg/net/http/server.go:1699
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+				}
+				if max := 1 * time.Second; tempDelay > max {
+					tempDelay = max
+				}
+				glog.Errorf("server/ListenAndServe: Accept error: %v; retrying in %v", err, tempDelay)
+				time.Sleep(tempDelay)
+				continue
+			}
+			return err
+		}
+
+		go this.handleConnection(conn)
+	}
+}
+
+func (this *Server) ListenAndServeTLS(uri string, cfg *tls.Config) error {
+	defer atomic.CompareAndSwapInt32(&this.running, 1, 0)
+
+	if !atomic.CompareAndSwapInt32(&this.running, 0, 1) {
+		return fmt.Errorf("server/ListenAndServe: Server is already running")
+	}
+
+	this.quit = make(chan struct{})
+
+	u, err := url.Parse(uri)
+	if err != nil {
+		return err
+	}
+
+	this.ln, err = tls.Listen(u.Scheme, u.Host, cfg)
+	if err != nil {
+		fmt.Println(err)
 		return err
 	}
 	defer this.ln.Close()
@@ -339,7 +398,8 @@ func (this *Server) handleConnection(c io.Closer) (svc *service, err error) {
 	//this.mu.Unlock()
 
 	glog.Infof("(%s) server/handleConnection: Connection established.", svc.cid())
-
+	fmt.Print("New client is connecting, Id: ", string(req.ClientId()), "\t")
+	fmt.Println("Version: ", req.Version())
 	return svc, nil
 }
 
